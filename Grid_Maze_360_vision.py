@@ -1,6 +1,5 @@
 import gymnasium as gym
 import minigrid
-import babyai
 import numpy as np
 from collections import defaultdict
 from gymnasium import spaces

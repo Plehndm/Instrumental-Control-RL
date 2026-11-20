@@ -1,91 +1,19 @@
+import argparse
 import gymnasium as gym
 import minigrid
-import babyai
 import os
 import json
 import numpy as np
-import torch
-import torch.nn as nn
-from stable_baselines3 import PPO
+from stable_baselines3 import DQN
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from Reward_Algorithm import *
 from Grid_Maze_360_vision import *
+from DQN_Agent import make_dqn, resolve_device, reset_optimizer, snapshot_weights, weights_equal
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-
-class ImprovedCNN(BaseFeaturesExtractor):
-    """
-    Same as the one in Training.
-    """
-    def __init__(self, observation_space, features_dim=256):
-        super().__init__(observation_space, features_dim)
-
-        obs_shape = observation_space.shape
-        in_channels = obs_shape[0]
-        H, W = obs_shape[1], obs_shape[2]
-
-        self.obj_stream = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Flatten(),
-        )
-
-        self.coord_stream = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Flatten(),
-        )
-
-        cx, cy = W // 2, H // 2
-        x_coords = (torch.arange(W).float() - cx) / max(cx, 1)
-        y_coords = (torch.arange(H).float() - cy) / max(cy, 1)
-        x_grid = x_coords.unsqueeze(0).expand(H, -1)
-        y_grid = y_coords.unsqueeze(1).expand(-1, W)
-        coord_grid = torch.stack([x_grid, y_grid], dim=0).unsqueeze(0)
-        self.register_buffer('coord_grid', coord_grid)
-
-        with torch.no_grad():
-            dummy_obj   = torch.zeros(1, in_channels, H, W)
-            dummy_coord = torch.zeros(1, 2, H, W)
-            n_obj   = self.obj_stream(dummy_obj).shape[1]
-            n_coord = self.coord_stream(dummy_coord).shape[1]
-
-        self.fusion = nn.Sequential(
-            nn.Linear(n_obj + n_coord, features_dim),
-            nn.LayerNorm(features_dim),
-            nn.Tanh()
-        )
-
-        self._apply_init()
-
-    def _apply_init(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.orthogonal_(m.weight, gain=1.414)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, observations):
-        obs = observations.float() / 10.0
-        B = obs.shape[0]
-        coords = self.coord_grid.expand(B, -1, -1, -1)
-        obj_feat   = self.obj_stream(obs)
-        coord_feat = self.coord_stream(coords)
-        combined = torch.cat([obj_feat, coord_feat], dim=1)
-        return self.fusion(combined)
-
 
 if "BabyAI-CleanTask-v0" not in gym.envs.registration.registry:
     gym.register(
@@ -182,73 +110,64 @@ def make_env_phase2(room_size, num_walls, num_pockets,
         return env
     return _init
 
-def train_phase2(mode, control_scale=2.0, map_seed=2000, total_steps=100000):
+def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100000, device="auto"):
     """
     Learning in Testing: fine-tunes agents on a fixed map with has_goal=True.
-    - 'random'  mode: initializes a random PPO model as a sanity check baseline.
-    - 'baseline' mode: loads the pre-trained baseline checkpoint and continues training.
-    - 'control'  mode: loads the pre-trained control checkpoint and continues training.
+    - 'random'   mode: a fresh DQN built with the same seed as Phase 1, so its weights
+                       are identical to the Baseline's Phase 1 starting weights.
+    - 'baseline' mode: loads the Phase 1 baseline checkpoint and continues training.
+    - 'control'  mode: loads the Phase 1 control checkpoint and continues training.
+    Every agent starts Phase 2 the same way: fresh optimizer, empty replay buffer,
+    same warm-up period, and the same random seed.
     """
     print(f"\n{'='*60}")
-    print(f"Learning in Testing: {mode.upper()} | has_goal=True | map_seed={map_seed}")
+    print(f"Learning in Testing: {mode.upper()} | has_goal=True | map_seed={map_seed} | seed={seed}")
     if mode != "random":
         print(f"Loading pre-trained model: model_{mode}_multimap_final.zip")
     else:
         print(f"Random model: initializing from scratch (sanity check)")
     print(f"{'='*60}\n")
- 
+
     use_control = (mode == "control")
- 
+
+    # No VecNormalize: adaptive reward statistics would differ between agents
     env = DummyVecEnv([
         make_env_phase2(
             room_size=11,
             num_walls=22,
             num_pockets=10,
-            use_control_reward=False,
+            use_control_reward=use_control,
             control_scale=control_scale,
             map_seed=map_seed,
         )
     ])
-  
-    env = VecNormalize(
-        env,
-        norm_obs=False,
-        norm_reward=True,
-        gamma=0.99,
-    )
- 
-    policy_kwargs = dict(
-        features_extractor_class=ImprovedCNN,
-        features_extractor_kwargs=dict(features_dim=256),
-        share_features_extractor=False
-    )
- 
+
     if mode == "random":
-        model = PPO(
-            "CnnPolicy",
-            env,
-            policy_kwargs=policy_kwargs,
-            learning_rate=2e-4,
-            n_steps=2048,
-            batch_size=256,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.05,
-            vf_coef=1.0,
-            max_grad_norm=0.5,
-            verbose=1,
-            tensorboard_log=f"./logs_phase2_{mode}/",
-        )
+        model = make_dqn(env, seed=seed, device=device,
+                         tensorboard_log=f"./logs_phase2_{mode}/")
+        # Sanity check: an untrained baseline should equal a fresh model with the same seed
+        if os.path.exists("model_baseline_multimap_final.zip"):
+            baseline = DQN.load("model_baseline_multimap_final", device=device)
+            same = weights_equal(snapshot_weights(model), snapshot_weights(baseline))
+            print(f"Random weights identical to Phase 1 baseline checkpoint: {same}"
+                  + ("" if same else "  (expected True; check that both phases used the same --seed)"))
+            del baseline
     else:
-         # Load pretrained weights; all hyperparameters are preserved
-        model = PPO.load(
+        # Load pretrained weights; hyperparameters are preserved. The replay buffer is not
+        # saved in the checkpoint, so it starts empty, just like the random agent's.
+        model = DQN.load(
             f"model_{mode}_multimap_final",
             env=env,
+            device=device,
             tensorboard_log=f"./logs_phase2_{mode}/",
         )
- 
+
+    # Identical starting conditions for every agent
+    reset_optimizer(model)          # no Adam state carried over from Phase 1
+    model._n_calls = 0              # align target-network update timing
+    model._n_updates = 0            # restart the update counter shown in the logs
+    model.set_random_seed(seed)     # same exploration / tie-break random stream
+
     # Print map layout info before training begins
     env.reset()
     base_env = env.envs[0]
@@ -256,9 +175,9 @@ def train_phase2(mode, control_scale=2.0, map_seed=2000, total_steps=100000):
         base_env = base_env.env
     print(f"Map info | agent_pos={tuple(base_env.agent_pos)} | "
           f"ball_pos={tuple(base_env.red_ball.cur_pos)}\n")
- 
+
     success_callback = SuccessTrackingCallback(log_freq=2000)
- 
+
     callbacks = [
         CheckpointCallback(
             save_freq=50000,
@@ -267,14 +186,14 @@ def train_phase2(mode, control_scale=2.0, map_seed=2000, total_steps=100000):
         ),
         success_callback,
     ]
- 
+
     print(f"Start learning...\n")
 
-
+    # reset_num_timesteps=True gives every agent the same learning_starts warm-up
     model.learn(
         total_timesteps=total_steps,
         callback=callbacks,
-        reset_num_timesteps=False,
+        reset_num_timesteps=True,
         progress_bar=False,
     )
  
@@ -476,23 +395,34 @@ def export_summary_excel(modes, total_steps, log_freq=2000,
  
 
 if __name__ == "__main__":
-    MODES       = ["baseline"]
-    MAP_SEED    = 2000
-    TOTAL_STEPS = 100000
-    CONTROL_SCALE = 100.0
- 
-    for mode in MODES:
+    parser = argparse.ArgumentParser(description="Phase 2: goal-directed fine-tuning on a fixed map.")
+    parser.add_argument("--modes", nargs="+", choices=["random", "baseline", "control"],
+                        default=["random", "baseline", "control"], help="Agents to train.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Model seed. Must match the seed used in Phase 1.")
+    parser.add_argument("--map-seed", type=int, default=2000, help="Seed of the fixed test map.")
+    parser.add_argument("--steps", type=int, default=100000, help="Training timesteps per agent.")
+    parser.add_argument("--control-scale", type=float, default=100.0,
+                        help="Multiplier on the control agent's freedom reward.")
+    parser.add_argument("--device", default="auto",
+                        help="'auto' (NVIDIA GPU if available, else CPU), 'cuda' or 'cpu'.")
+    parser.add_argument("--output", default="phase2_summary.xlsx", help="Excel summary path.")
+    args = parser.parse_args()
+    args.device = resolve_device(args.device)
+
+    for mode in args.modes:
         train_phase2(
             mode=mode,
-            control_scale=CONTROL_SCALE,
-            map_seed=MAP_SEED,
-            total_steps=TOTAL_STEPS,
+            seed=args.seed,
+            control_scale=args.control_scale,
+            map_seed=args.map_seed,
+            total_steps=args.steps,
+            device=args.device,
         )
 
     export_summary_excel(
-        modes=MODES,
-        total_steps=TOTAL_STEPS,
+        modes=args.modes,
+        total_steps=args.steps,
         log_freq=2000,
-        output_path="phase2_summary_baseline.xlsx",
+        output_path=args.output,
     )
-
