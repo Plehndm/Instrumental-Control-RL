@@ -194,7 +194,7 @@ foreach ($s in 0..4) {
 | `--seed` | both | `0` | Model seed; must match between phases |
 | `--steps` | both | `100000` | Training timesteps per agent |
 | `--control-scale` | both | `100.0` | Multiplier on the freedom reward |
-| `--device` | both | `cpu` | `cpu` is exactly reproducible; `cuda`/`auto` may be faster but not bit-for-bit reproducible |
+| `--device` | both | `auto` | `auto` uses an NVIDIA GPU if available, otherwise the CPU; `cuda` or `cpu` forces one. Deterministic GPU settings are on, so results are reproducible on either |
 | `--map-seed` | 2 | `2000` | Seed of the fixed test map |
 | `--output` | 2 | `phase2_summary.xlsx` | Excel summary path |
 
