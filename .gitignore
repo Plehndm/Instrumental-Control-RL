@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+liljeholm_venv/
+venv/
+.venv/
+
+# Training outputs
+*.zip
+logs_*/
+checkpoints_*/
+success_log_*.json
+*.xlsx
