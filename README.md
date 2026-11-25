@@ -32,8 +32,10 @@ Learning in Testing.py     Phase 2 training: goal-directed fine-tuning
 
 A custom MiniGrid environment with:
 - **4-action space**: turn left, turn right, move forward, move backward
-- **4-channel local observation** (7×7 window): object type, color, wall
-  state, and a directional freedom value
+- **8-channel local observation** (7×7 window): object type, color, four
+  blocked-edge flags (ahead, behind, left, right relative to the agent), a
+  directional freedom value, and a visited flag marking the cells entered so
+  far this episode
 - **MultiWallCell**: grid cells that support directional walls on any of
   their four edges, used to construct "pockets" — low-freedom regions
   that restrict movement
@@ -50,29 +52,36 @@ freedom(cell) = accessible_directions / 4.0
 
 where a direction is accessible if neither the current cell's exit edge
 nor the neighboring cell's entry edge has a wall. This value is encoded
-directly into the 4th observation channel, making local controllability
+directly into the 7th observation channel, making local controllability
 visible to the policy network without requiring it to be inferred from
 raw pixel data.
 
 ### 360-degree observation
 
-`gen_obs()` samples both the agent's current facing direction and its
-opposite, merging the two views into a single 7×7 window. This ensures
-full 360-degree awareness within the limited local window.
+`gen_obs()` builds a single 7×7 window around the agent, rotated so the agent
+always faces the top row. Only walled edges block sight, so an agent standing
+in a cell that has walls can still see out through its open sides. The window
+includes the agent's own cell, so it can see the walls around itself.
 
 ## Reward design (`Reward_Algorithm.py`)
 
 ### EmpiricalInstrumentalDivergenceWrapper
 
-Adds an intrinsic reward to the control agent based on the freedom of the
-cell the agent moves into:
+Adds an intrinsic reward to the control agent (Phase 1 only) for entering a
+cell for the first time in an episode:
 
 ```
-intrinsic_reward = (freedom ** 2) * scale
+control_value     = control_decay ** steps_to_nearest_control_point
+intrinsic_reward  = control_value * scale   (new cell; otherwise 0)
 total_reward      = env_reward + intrinsic_reward
 ```
 
-Squaring the freedom value amplifies the preference for highly open cells. 
+Control points are the cells with full directional freedom (1.0). Distance is
+counted in walking steps around walls, so control values rise along every
+shortest path to a control point. `control_decay` is 0.8. Turning, blocked
+moves and revisits earn nothing, and the starting cell counts as visited.
+The environment's visit record decides what is new, and the same record fills
+the visited observation channel, so the agent can see which cells will not pay.
 The wrapper independently recomputes freedom from the grid state 
 (rather than reading the observation tensor), so it can be attached or removed 
 without changing the environment itself.
@@ -103,7 +112,7 @@ Both agents are trained from scratch with **no goal present**
 - **Baseline agent**: no reward at all. Its Q-network therefore stays exactly
   at its initial weights; the script verifies this bit-for-bit at the end of
   training and raises an error if anything changed.
-- **Control agent**: the freedom-based intrinsic reward from
+- **Control agent**: the new-cell control reward from
   `EmpiricalInstrumentalDivergenceWrapper`, which is its only learning signal.
 
 `CoveringMultiMapWrapper` ensures the agent trains across a continuous
@@ -114,23 +123,30 @@ stream of new maps and spawn points, ensuring it's learning a generalizable expl
 Phase 2 introduces `has_goal=True` and fine-tunes each agent on a single
 fixed map (via `FixedSeedWrapper`) so that learning curves are comparable
 across agents. Every agent starts Phase 2 the same way: a fresh optimizer
-(no Adam state carried over), an empty replay buffer, the same warm-up
-period, and the same random seed.
+(no Adam state carried over), an empty replay buffer, and the same
+random seed. There is no random-action warm-up: agents pick their own actions
+from step 1, and learning starts after 1,000 steps.
 
-Three conditions are tested:
+Five conditions are tested:
 - **random**: a fresh DQN built with the same seed as Phase 1. Its weights
   are identical to the Baseline's Phase 1 starting weights (the script checks
   this), so it serves as a sanity check: **Random and Baseline should produce
   identical results**.
 - **baseline**: Phase 1 baseline checkpoint, continued training
-- **control**: Phase 1 control checkpoint, continued training, with the
-  freedom reward still active
+- **control**: Phase 1 control checkpoint, continued training
+- **control_greedy**: same as control, but with no random actions (the others use 10%)
+- **control_frozen**: no random actions and no Phase 2 learning, so it follows its
+  Phase 1 training only
+
+All agents get the same Phase 2 reward: +255 for reaching the red ball
+and nothing else. The control reward is not used in Phase 2, so the agents are
+compared on the same goal-only reward.
 
 `SuccessTrackingCallback` records every successful episode
 along with its relative timestep and episode length, enabling step-trend
 analysis across training. Results are exported to a formatted Excel
 workbook (`export_summary_excel`) summarising success counts and average
-steps-to-goal per time window for direct comparison across the three agents.
+steps-to-goal per time window for direct comparison across the agents.
 
 ## Running the experiment
 
@@ -170,7 +186,7 @@ The baseline run must end with
 python "Learning in Testing.py" --seed 0
 ```
 
-This trains random, baseline and control in turn, then writes the Excel
+This trains the five agents in turn, then writes the Excel
 summary. The random run should print
 `Random weights identical to Phase 1 baseline checkpoint: True`.
 
@@ -193,7 +209,7 @@ foreach ($s in 0..4) {
 | `--modes` | both | all agents | Which agents to train |
 | `--seed` | both | `0` | Model seed; must match between phases |
 | `--steps` | both | `100000` | Training timesteps per agent |
-| `--control-scale` | both | `100.0` | Multiplier on the freedom reward |
+| `--control-scale` | 1 | `100.0` | Multiplier on the new-cell control reward |
 | `--device` | both | `auto` | `auto` uses an NVIDIA GPU if available, otherwise the CPU; `cuda` or `cpu` forces one. Deterministic GPU settings are on, so results are reproducible on either |
 | `--map-seed` | 2 | `2000` | Seed of the fixed test map |
 | `--output` | 2 | `phase2_summary.xlsx` | Excel summary path |

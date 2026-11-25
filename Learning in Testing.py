@@ -10,7 +10,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from Reward_Algorithm import *
 from Grid_Maze_360_vision import *
-from DQN_Agent import make_dqn, resolve_device, reset_optimizer, snapshot_weights, weights_equal
+from DQN_Agent import (EPSILON, NoWarmupDQN, make_dqn, reset_optimizer, resolve_device,
+                       set_epsilon, snapshot_weights, weights_equal)
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -20,6 +21,15 @@ if "BabyAI-CleanTask-v0" not in gym.envs.registration.registry:
         id='BabyAI-CleanTask-v0',
         entry_point=CleanTaskEnv,
     )
+
+# Phase 2 agents: (Phase 1 model to load, rate of random actions, learns in Phase 2)
+AGENTS = {
+    "random":         (None,       EPSILON, True),
+    "baseline":       ("baseline", EPSILON, True),
+    "control":        ("control",  EPSILON, True),
+    "control_greedy": ("control",  0.0,     True),
+    "control_frozen": ("control",  0.0,     False),
+}
 
 class FixedSeedWrapper(gym.Wrapper):
     """
@@ -85,9 +95,12 @@ class SuccessTrackingCallback(BaseCallback):
                       f"Total successes: {total}")
         return True
 
-def make_env_phase2(room_size, num_walls, num_pockets,
-                    use_control_reward=False, control_scale=2.0,
-                    map_seed=2000):
+def make_env_phase2(room_size, num_walls, num_pockets, map_seed=2000):
+    """
+    Phase 2 environment. Every agent gets the same reward: +255 for reaching the
+    red ball and nothing else. The control agent's Phase 1 reward is deliberately
+    left out so that all agents are compared on the same goal-only reward.
+    """
     def _init():
         env = gym.make(
             "BabyAI-CleanTask-v0",
@@ -99,36 +112,36 @@ def make_env_phase2(room_size, num_walls, num_pockets,
             render_mode="rgb_array"
         )
         env = ImgObsWrapper(env)
-
-        if use_control_reward:
-            env = EmpiricalInstrumentalDivergenceWrapper(
-                env, scale=control_scale,
-            )
-
         env = FixedSeedWrapper(env, seed=map_seed)
         env = Monitor(env)
         return env
     return _init
 
-def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100000, device="auto"):
+def train_phase2(mode, seed=0, map_seed=2000, total_steps=100000, device="auto"):
     """
     Learning in Testing: fine-tunes agents on a fixed map with has_goal=True.
     - 'random'   mode: a fresh DQN built with the same seed as Phase 1, so its weights
                        are identical to the Baseline's Phase 1 starting weights.
     - 'baseline' mode: loads the Phase 1 baseline checkpoint and continues training.
     - 'control'  mode: loads the Phase 1 control checkpoint and continues training.
+    - 'control_greedy': like 'control', but takes no random actions.
+    - 'control_frozen': like 'control_greedy', but never learns in Phase 2, so it
+                        follows its Phase 1 training only.
     Every agent starts Phase 2 the same way: fresh optimizer, empty replay buffer,
-    same warm-up period, and the same random seed.
+    the same random seed, and the same goal-only reward. There is no random warm-up:
+    agents pick their own actions from step 1, and learning starts after
+    learning_starts steps (1,000).
     """
+    source, epsilon, learns = AGENTS[mode]
     print(f"\n{'='*60}")
     print(f"Learning in Testing: {mode.upper()} | has_goal=True | map_seed={map_seed} | seed={seed}")
     if mode != "random":
-        print(f"Loading pre-trained model: model_{mode}_multimap_final.zip")
+        print(f"Loading pre-trained model: model_{source}_multimap_final.zip")
     else:
         print(f"Random model: initializing from scratch (sanity check)")
     print(f"{'='*60}\n")
 
-    use_control = (mode == "control")
+    print(f"Random actions: {epsilon:.0%} | learns in Phase 2: {learns} | random warm-up: none")
 
     # No VecNormalize: adaptive reward statistics would differ between agents
     env = DummyVecEnv([
@@ -136,15 +149,13 @@ def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100
             room_size=11,
             num_walls=22,
             num_pockets=10,
-            use_control_reward=use_control,
-            control_scale=control_scale,
             map_seed=map_seed,
         )
     ])
 
     if mode == "random":
         model = make_dqn(env, seed=seed, device=device,
-                         tensorboard_log=f"./logs_phase2_{mode}/")
+                         tensorboard_log=f"./logs_phase2_{mode}/", algo=NoWarmupDQN)
         # Sanity check: an untrained baseline should equal a fresh model with the same seed
         if os.path.exists("model_baseline_multimap_final.zip"):
             baseline = DQN.load("model_baseline_multimap_final", device=device)
@@ -155,8 +166,8 @@ def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100
     else:
         # Load pretrained weights; hyperparameters are preserved. The replay buffer is not
         # saved in the checkpoint, so it starts empty, just like the random agent's.
-        model = DQN.load(
-            f"model_{mode}_multimap_final",
+        model = NoWarmupDQN.load(
+            f"model_{source}_multimap_final",
             env=env,
             device=device,
             tensorboard_log=f"./logs_phase2_{mode}/",
@@ -167,6 +178,11 @@ def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100
     model._n_calls = 0              # align target-network update timing
     model._n_updates = 0            # restart the update counter shown in the logs
     model.set_random_seed(seed)     # same exploration / tie-break random stream
+
+    set_epsilon(model, epsilon)
+    if not learns:
+        model.learning_starts = total_steps  # never reached, so no gradient updates
+    phase1_weights = snapshot_weights(model)
 
     # Print map layout info before training begins
     env.reset()
@@ -189,7 +205,7 @@ def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100
 
     print(f"Start learning...\n")
 
-    # reset_num_timesteps=True gives every agent the same learning_starts warm-up
+    # reset_num_timesteps=True makes every agent start learning at the same step
     model.learn(
         total_timesteps=total_steps,
         callback=callbacks,
@@ -197,6 +213,9 @@ def train_phase2(mode, seed=0, control_scale=2.0, map_seed=2000, total_steps=100
         progress_bar=False,
     )
  
+    if not learns and not weights_equal(phase1_weights, snapshot_weights(model)):
+        raise RuntimeError(f"{mode} weights changed during Phase 2, but it should not learn.")
+
     # Save model
     model.save(f"model_{mode}_phase2_final")
     print(f"\nModel saved: model_{mode}_phase2_final.zip")
@@ -275,6 +294,8 @@ def export_summary_excel(modes, total_steps, log_freq=2000,
         "random":   "C55A11",
         "baseline": "2E75B6",
         "control":  "375623",
+        "control_greedy": "7030A0",
+        "control_frozen": "595959",
     }
  
     # Title row
@@ -291,7 +312,7 @@ def export_summary_excel(modes, total_steps, log_freq=2000,
     ws.merge_cells(f"A2:{last_col}2")
     ws["A2"] = (f"Total steps: {total_steps:,}    |    "
                 f"Window: {log_freq:,} steps    |    "
-                f"Modes: {', '.join(m.capitalize() for m in modes)}")
+                f"Modes: {', '.join(m.replace('_', ' ').capitalize() for m in modes)}")
     ws["A2"].font      = Font(name="Arial", italic=True, size=9, color="595959")
     ws["A2"].alignment = left
     ws.row_dimensions[2].height = 16
@@ -316,7 +337,7 @@ def export_summary_excel(modes, total_steps, log_freq=2000,
  
         # Group header
         ws.merge_cells(start_row=4, start_column=sc, end_row=4, end_column=sc+1)
-        cell = ws.cell(row=4, column=sc, value=mode.capitalize())
+        cell = ws.cell(row=4, column=sc, value=mode.replace('_', ' ').capitalize())
         cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=11)
         cell.fill      = PatternFill("solid", start_color=mode_colors.get(mode, "2E75B6"))
         cell.alignment = center
@@ -396,14 +417,12 @@ def export_summary_excel(modes, total_steps, log_freq=2000,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 2: goal-directed fine-tuning on a fixed map.")
-    parser.add_argument("--modes", nargs="+", choices=["random", "baseline", "control"],
-                        default=["random", "baseline", "control"], help="Agents to train.")
+    parser.add_argument("--modes", nargs="+", choices=list(AGENTS),
+                        default=list(AGENTS), help="Agents to train.")
     parser.add_argument("--seed", type=int, default=0,
                         help="Model seed. Must match the seed used in Phase 1.")
     parser.add_argument("--map-seed", type=int, default=2000, help="Seed of the fixed test map.")
     parser.add_argument("--steps", type=int, default=100000, help="Training timesteps per agent.")
-    parser.add_argument("--control-scale", type=float, default=100.0,
-                        help="Multiplier on the control agent's freedom reward.")
     parser.add_argument("--device", default="auto",
                         help="'auto' (NVIDIA GPU if available, else CPU), 'cuda' or 'cpu'.")
     parser.add_argument("--output", default="phase2_summary.xlsx", help="Excel summary path.")
@@ -414,7 +433,6 @@ if __name__ == "__main__":
         train_phase2(
             mode=mode,
             seed=args.seed,
-            control_scale=args.control_scale,
             map_seed=args.map_seed,
             total_steps=args.steps,
             device=args.device,

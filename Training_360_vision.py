@@ -90,6 +90,8 @@ class CoveringMultiMapWrapper(gym.Wrapper):
 
         base_env.agent_pos = np.array([pos_x, pos_y])
         base_env.agent_dir = direction
+        # The agent was moved, so the visited cells must restart from the new cell
+        base_env.start_visit_tracking()
 
         raw_obs = base_env.gen_obs()
         obs = self.env.observation(raw_obs)
@@ -152,8 +154,8 @@ class EmpiricalIDCallback(BaseCallback):
                     stats = env.get_stats()
                     print(f"  ID stats:")
                     print(f"    Avg ID reward: {stats.get('avg_intrinsic_reward', 0):.3f}")
-                    if 'avg_freedom' in stats:
-                        print(f"    avg_freedom: {stats['avg_freedom']:.3f}")
+                    if 'avg_control' in stats:
+                        print(f"    avg_control: {stats['avg_control']:.3f}")
                     break
                 env = env.env
 
@@ -200,7 +202,7 @@ def train_with_curriculum(mode, seed=0, control_scale=100.0, total_steps=100000,
     Phase 1: exploration-only training (has_goal=False) across many maps with DQN.
     - 'baseline': no reward at all, so its Q-network must stay exactly at its
       initial weights. This is verified at the end of training.
-    - 'control':  freedom-based intrinsic reward; the only source of learning.
+    - 'control':  new-cell control reward; the only source of learning.
     Use the same seed for both modes so they start from identical weights.
     """
     print(f"Initializing {mode.upper()} mode (seed={seed})...")
@@ -283,7 +285,7 @@ if __name__ == "__main__":
                         help="Model seed. Use the same value in Phase 2.")
     parser.add_argument("--steps", type=int, default=100000, help="Training timesteps per agent.")
     parser.add_argument("--control-scale", type=float, default=100.0,
-                        help="Multiplier on the control agent's freedom reward.")
+                        help="Multiplier on the control agent's new-cell control reward.")
     parser.add_argument("--device", default="auto",
                         help="'auto' (NVIDIA GPU if available, else CPU), 'cuda' or 'cpu'.")
     args = parser.parse_args()

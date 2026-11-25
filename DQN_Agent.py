@@ -27,6 +27,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.use_deterministic_algorithms(True, warn_only=True)
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.utils import LinearSchedule
 from stable_baselines3.dqn.policies import DQNPolicy, QNetwork
 
 
@@ -97,8 +98,9 @@ class ImprovedCNN(BaseFeaturesExtractor):
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, observations):
-        obs = observations.float() / 10.0
-        B = obs.shape[0]
+        # 255 (SB3 no longer applies this itself, see ImgObsWrapper) x 10
+        obs = observations.float() / 2550.0
+        B =obs.shape[0]
         coords = self.coord_grid.expand(B, -1, -1, -1)
         obj_feat   = self.obj_stream(obs)
         coord_feat = self.coord_stream(coords)
@@ -171,9 +173,27 @@ def resolve_device(device="auto"):
     return device
 
 
-def make_dqn(env, seed, tensorboard_log=None, device="auto", verbose=1):
+class NoWarmupDQN(DQN):
+    """
+    DQN without SB3's random-action warm-up: the agent picks its own actions from the
+    first step. learning_starts then only delays gradient updates, not the policy.
+    Used in Phase 2 so that what was learned in Phase 1 is visible immediately.
+    """
+    def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
+        return super()._sample_action(0, action_noise, n_envs)
+
+
+def set_epsilon(model, epsilon):
+    """Use a constant rate of random actions."""
+    model.exploration_initial_eps = epsilon
+    model.exploration_final_eps = epsilon
+    model.exploration_rate = epsilon
+    model.exploration_schedule = LinearSchedule(epsilon, epsilon, 1.0)
+
+
+def make_dqn(env, seed, tensorboard_log=None, device="auto", verbose=1, algo=DQN):
     """Build a fresh DQN agent. The same seed always gives the same initial weights."""
-    return DQN(
+    return algo(
         ZeroHeadDQNPolicy,
         env,
         policy_kwargs=POLICY_KWARGS,

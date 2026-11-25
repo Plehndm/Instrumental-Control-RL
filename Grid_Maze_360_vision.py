@@ -13,15 +13,19 @@ class ImgObsWrapper(gym.ObservationWrapper):
     """
     Converts the default dict observation {"image": [...], ...} into a
     plain numpy array with shape (C, H, W), compatible with CNN-based policies.
-    Supports the customized 4-channel 360-degree observation format.
+    Supports the customized 8-channel 360-degree observation format.
     """
     def __init__(self, env):
         super().__init__(env)
         obs_shape = env.observation_space.spaces["image"].shape
+        shape = (obs_shape[2], obs_shape[0], obs_shape[1])
+        # The visited channel (last) only goes up to 100. Declaring that also stops
+        # Stable-Baselines3 from treating the observation as a 0-255 photo: with 8
+        # channels on a 7x7 view it would wrongly transpose the channel axis.
+        high = np.full(shape, 255, dtype=np.uint8)
+        high[-1] = 100
         self.observation_space = gym.spaces.Box(
-            low=0, high=255,
-            shape=(obs_shape[2], obs_shape[0], obs_shape[1]),
-            dtype=np.uint8
+            low=np.zeros(shape, dtype=np.uint8), high=high, dtype=np.uint8
         )
 
     def observation(self, obs):
@@ -104,7 +108,7 @@ class CleanTaskEnv(MiniGridEnv):
     """
     Custom MiniGrid environment with:
     - 4-action space: turn left, turn right, move forward, move backward
-    - 4-channel 360-degree local observation (7x7 square vision)
+    - 8-channel 360-degree local observation (7x7 square vision)
     - MultiWallCell obstacles that create pockets with low directional freedom
     - Optional red ball goal with sparse reward (+255 on reach)
     """
@@ -116,6 +120,7 @@ class CleanTaskEnv(MiniGridEnv):
         self.has_goal = has_goal
         mission_space = MissionSpace(mission_func=lambda: "go to the red ball")
         self.position_history = []
+        self.episode_visit_counts = defaultdict(int)
 
         super().__init__(
             mission_space=mission_space,
@@ -134,13 +139,13 @@ class CleanTaskEnv(MiniGridEnv):
             'backward': 3,
         })()
 
-        # Redefine observation space as 4-channel 360-degree view
+        # Redefine observation space as 8-channel 360-degree view
         vs = self.agent_view_size
         self.observation_space = spaces.Dict({
             **self.observation_space.spaces,
             "image": spaces.Box(
                 low=0, high=255,
-                shape=(vs, vs, 7),
+                shape=(vs, vs, 8),
                 dtype=np.uint8
             )
         })
@@ -183,129 +188,150 @@ class CleanTaskEnv(MiniGridEnv):
 
         return accessible / 4.0
 
+    # Absolute directions, indexed like agent_dir: 0=right, 1=down, 2=left, 3=up
+    _DIR_VECS = ((1, 0), (0, 1), (-1, 0), (0, -1))
+    _DIR_EDGES = ('right', 'bottom', 'left', 'top')
+
+    def _edge_blocked(self, position, direction):
+        """
+        True if the edge of position facing an absolute direction cannot be crossed:
+        a wall on this cell's side, a wall on the neighbour's side, or the outer wall.
+        These are the same rules as movement and directional freedom.
+        """
+        dx, dy = self._DIR_VECS[direction]
+        tx, ty = position[0] + dx, position[1] + dy
+        if not (0 < tx < self.width - 1 and 0 < ty < self.height - 1):
+            return True
+        cell = self.grid.get(*position)
+        if isinstance(cell, MultiWallCell) and cell.has_wall(self._DIR_EDGES[direction]):
+            return True
+        target = self.grid.get(tx, ty)
+        if isinstance(target, MultiWallCell):
+            return target.has_wall(self._DIR_EDGES[(direction + 2) % 4])
+        return target is not None and target.type == 'wall'
+
+    def _visible_cells(self, r):
+        """
+        Offsets (dx, dy) of the cells the agent can see within r cells, in all
+        directions. A cell is visible if it can be reached by stepping only away
+        from the agent without crossing a walled edge. Sight depends on edges, not on
+        cell type, so standing in a cell that has walls never blinds the agent. The
+        outer wall next to a visible cell is visible but blocks sight beyond it.
+        """
+        ax, ay = int(self.agent_pos[0]), int(self.agent_pos[1])
+        visible = {(0, 0)}
+        offsets = [(dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)]
+        # Nearest first, so a cell's predecessors are always decided before it
+        offsets.sort(key=lambda o: abs(o[0]) + abs(o[1]))
+        for dx, dy in offsets[1:]:
+            x, y = ax + dx, ay + dy
+            if not (0 <= x < self.width and 0 <= y < self.height):
+                continue
+            is_border = not (0 < x < self.width - 1 and 0 < y < self.height - 1)
+            # (predecessor offset, direction of travel from it into this cell)
+            steps = []
+            if dx:
+                steps.append(((dx - (1 if dx > 0 else -1), dy), 0 if dx > 0 else 2))
+            if dy:
+                steps.append(((dx, dy - (1 if dy > 0 else -1)), 1 if dy > 0 else 3))
+            for prev, direction in steps:
+                if prev not in visible:
+                    continue
+                px, py = ax + prev[0], ay + prev[1]
+                if not (0 < px < self.width - 1 and 0 < py < self.height - 1):
+                    continue  # cannot see past the outer wall
+                if is_border:
+                    cell = self.grid.get(px, py)
+                    blocked = (isinstance(cell, MultiWallCell)
+                               and cell.has_wall(self._DIR_EDGES[direction]))
+                else:
+                    blocked = self._edge_blocked((px, py), direction)
+                if not blocked:
+                    visible.add((dx, dy))
+                    break
+        return visible
+
     def gen_obs(self):
         """
-        Generate a 4-channel 360-degree observation centered on the agent.
-        Channels: [object_type, color, wall_state, freedom_value].
-        The red ball cell is encoded with freedom=255 as the biggest signal.
+        Generate an 8-channel 360-degree observation centered on the agent and
+        rotated so that the agent always faces the top row.
+        Channels:
+        0    object type
+        1    color
+        2-5  blocked edge of the cell: ahead, behind, left, right RELATIVE TO THE AGENT
+             (100 if it cannot be crossed, else 0)
+        6    directional freedom * 100; the red ball cell is 255, the biggest signal
+        7    visited: 100 for cells entered this episode (including the agent's own
+             cell). A memory, so it is filled in even for cells that are now hidden.
+        The agent's own cell is included, so it can see the walls around itself.
         """
-        vs = self.agent_view_size  
-        r = vs // 2                
+        vs = self.agent_view_size
+        r = vs // 2
         ax, ay = int(self.agent_pos[0]), int(self.agent_pos[1])
+        facing = int(self.agent_dir)
+        fx, fy = self._DIR_VECS[facing]
+        rx, ry = self._DIR_VECS[(facing + 1) % 4]
+        # Absolute directions of the agent's ahead, behind, left and right
+        relative_dirs = [facing, (facing + 2) % 4, (facing + 3) % 4, (facing + 1) % 4]
 
-        obs_image = np.zeros((vs, vs, 7), dtype=np.uint8) 
-        original_dir = self.agent_dir
+        obs_image = np.zeros((vs, vs, 8), dtype=np.uint8)
+        visible = self._visible_cells(r)
 
-        dirs_to_sample = [original_dir, (original_dir + 2) % 4]
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                x, y = ax + dx, ay + dy
+                row = r - (dx * fx + dy * fy)
+                col = r + (dx * rx + dy * ry)
 
-        # Sample from current direction and opposite direction for 360 coverage
-        for sample_dir in dirs_to_sample:
-            self.agent_dir = sample_dir
-            grid, vis_mask = self.gen_obs_grid()
-            self.agent_dir = original_dir
+                if (dx, dy) == (0, 0) or (x, y) in self.episode_visit_counts:
+                    obs_image[row, col, 7] = 100
 
-            for gx in range(ax - r, ax + r + 1):
-                for gy in range(ay - r, ay + r + 1):
-                    if gx == ax and gy == ay:
-                        continue
+                if (dx, dy) not in visible:
+                    continue
 
-                    self.agent_dir = sample_dir
-                    vx, vy = self.get_view_coords(gx, gy)
-                    self.agent_dir = original_dir
+                cell = self.grid.get(x, y)
+                if cell is None:
+                    obs_image[row, col, 0] = OBJECT_TO_IDX['empty']
+                else:
+                    encoded = cell.encode()
+                    obs_image[row, col, 0] = encoded[0]
+                    obs_image[row, col, 1] = encoded[1]
 
-                    if vx < 0 or vy < 0 or vx >= vs or vy >= vs:
-                        continue
-                    if not vis_mask[vx, vy]:
-                        continue
+                if not (0 < x < self.width - 1 and 0 < y < self.height - 1):
+                    obs_image[row, col, 2:6] = 100  # outer wall: blocked on every side
+                    continue
 
-                    self.agent_dir = original_dir
-                    ox, oy = self.get_view_coords(gx, gy)
-                    self.agent_dir = original_dir
+                for i, direction in enumerate(relative_dirs):
+                    if self._edge_blocked((x, y), direction):
+                        obs_image[row, col, 2 + i] = 100
 
-                    oy_out = oy - r
-                    ox_out = ox
-
-                    if oy_out < 0:
-                        oy_out = vs + oy_out
-
-                    if oy_out < 0 or oy_out >= vs or ox_out < 0 or ox_out >= vs:
-                        continue
-
-                    if np.any(obs_image[oy_out, ox_out, :3] != 0):
-                        continue
-
-                    # cell = grid.get(vx, vy)
-                    # if cell is None:
-                    #     encoded = np.array([OBJECT_TO_IDX['empty'], 0, 0], dtype=np.uint8)
-                    # else:
-                    #     encoded = np.array(cell.encode(), dtype=np.uint8)
-
-                    # obs_image[oy_out, ox_out, :3] = encoded
-
-                    cell = grid.get(vx, vy)
-
-                    if cell is None:
-                        # Empty cell
-                        obs_image[oy_out, ox_out, 0] = OBJECT_TO_IDX['empty']
-                        obs_image[oy_out, ox_out, 1:6] = 0
-
-                    else:
-                        encoded = cell.encode()
-
-                        obs_image[oy_out, ox_out, 0] = encoded[0]
-
-                        obs_image[oy_out, ox_out, 1] = encoded[1]
-
-                        wall_state = int(encoded[2])
-
-                        obs_image[oy_out, ox_out, 2] = 1 if wall_state & 1 else 0  
-                        obs_image[oy_out, ox_out, 3] = 1 if wall_state & 2 else 0  
-                        obs_image[oy_out, ox_out, 4] = 1 if wall_state & 4 else 0  
-                        obs_image[oy_out, ox_out, 5] = 1 if wall_state & 8 else 0  
-
-                    # if 0 < gx < self.width - 1 and 0 < gy < self.height - 1:
-                    #     cell_at_pos = self.grid.get(gx, gy)
-                    #     if cell_at_pos is not None and hasattr(cell_at_pos, 'type') and cell_at_pos.type == 'ball':
-                    #         obs_image[oy_out, ox_out, 3] = 255  
-                    #     else:
-                    #         freedom = self._compute_directional_freedom((gx, gy))
-                    #         obs_image[oy_out, ox_out, 3] = freedom * 100
-
-                    if 0 < gx < self.width - 1 and 0 < gy < self.height - 1:
-                        cell_at_pos = self.grid.get(gx, gy)
-
-                        if (
-                            cell_at_pos is not None
-                            and hasattr(cell_at_pos, 'type')
-                            and cell_at_pos.type == 'ball'
-                        ):
-                            obs_image[oy_out, ox_out, 6] = 255
-                        else:
-                            freedom = self._compute_directional_freedom((gx, gy))
-                            obs_image[oy_out, ox_out, 6] = int(freedom * 100)
-                
-        # Write agent's own cell at center
-        obs_image[r, r] = np.array([
-        OBJECT_TO_IDX['empty'], 0, 0, 0, 0, 0, 0
-        ], dtype=np.uint8)
+                if cell is not None and cell.type == 'ball':
+                    obs_image[row, col, 6] = 255
+                else:
+                    obs_image[row, col, 6] = int(self._compute_directional_freedom((x, y)) * 100)
 
         return {
-        "image": obs_image,
-        "direction": original_dir,
-        "mission": self.mission,
+            "image": obs_image,
+            "direction": self.agent_dir,
+            "mission": self.mission,
         }
-    
+
     def _manhattan_distance(self, pos1, pos2):
         """Compute Manhattan distance between two grid positions."""
         return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
 
-    def reset(self, **kwargs):
-        obs, info = super().reset(**kwargs)
+    def start_visit_tracking(self):
+        """Forget all visited cells; only the agent's current cell counts as visited."""
+        current_pos = tuple(int(v) for v in self.agent_pos)
         self.episode_visit_counts = defaultdict(int)
-        self.position_history = [tuple(self.agent_pos)]
-
-        current_pos = tuple(self.agent_pos)
         self.episode_visit_counts[current_pos] = 1
+        self.position_history = [current_pos]
+
+    def reset(self, **kwargs):
+        # Clear first: super().reset() already generates an observation
+        self.episode_visit_counts = defaultdict(int)
+        obs, info = super().reset(**kwargs)
+        self.start_visit_tracking()
 
         total_cells = (self.grid.width - 2) * (self.grid.height - 2)
         info["coverage"] = (1 / total_cells) * 100
@@ -383,7 +409,8 @@ class CleanTaskEnv(MiniGridEnv):
             info = {
                 "coverage": (unique_visited / total_cells) * 100,
                 "unique_visited": unique_visited,
-                "agent_pos": current_pos
+                "agent_pos": current_pos,
+                "new_cell": False
             }
             return obs, 0.0, False, self.step_count >= self.max_steps, info
 
@@ -393,6 +420,7 @@ class CleanTaskEnv(MiniGridEnv):
 
         current_pos = tuple(self.agent_pos)
         self.position_history.append(current_pos)
+        info["new_cell"] = current_pos not in self.episode_visit_counts
         self.episode_visit_counts[current_pos] += 1
 
         unique_visited = len(self.episode_visit_counts)
